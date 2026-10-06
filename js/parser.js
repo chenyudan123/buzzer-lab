@@ -11,6 +11,7 @@
     [/^energy$/, "energy"],
     [/^(math|mathematics)$/, "math"],
     [/^general\s*science$/, "general"],
+    [/^earth\b/, "earth"],
   ];
   const CATEGORY_NAMES = {
     life: "Life Science", physical: "Physical Science", chem: "Chemistry", physics: "Physics",
@@ -20,6 +21,11 @@
   function categoryKey(raw) {
     const s = String(raw || "").toLowerCase().replace(/[^a-z& ]/g, " ").replace(/\s+/g, " ").trim();
     for (const [re, key] of CATEGORY_MAP) if (re.test(s)) return key;
+    const w = s.split(" ");
+    for (const n of [4, 3, 2, 1]) {   // e.g. "MATH Math" or "Earth and Space Science extra"
+      const head = w.slice(0, n).join(" ");
+      for (const [re, key] of CATEGORY_MAP) if (re.test(head)) return key;
+    }
     return "other";
   }
 
@@ -86,23 +92,37 @@
   }
 
   function parseOne(body, h, meta) {
-    const ansIdx = body.search(/\bANSWER\s*:/i);
+    // "ANSWER:", "ANSWER W)", "ANWER:", "Answer:" (but not the "Short Answer" label)
+    let ansIdx = -1, ansLen = 0;
+    const ar = /\b(?:ANS?WER\b\s*:?|Ans?wer\s*:)\s*/g;
+    let am;
+    while ((am = ar.exec(body))) {
+      if (/short\s*$/i.test(body.slice(Math.max(0, am.index - 7), am.index))) continue;
+      ansIdx = am.index; ansLen = am[0].length; break;
+    }
     if (ansIdx < 0) return null;
     let head = body.slice(0, ansIdx);
-    let answer = squash(body.slice(ansIdx).replace(/^\s*ANSWER\s*:\s*/i, ""));
+    let rest = body.slice(ansIdx + ansLen);
+    // stop at a following question that lost its TOSS-UP/BONUS label, or at end-of-round moderator script
+    const stop = rest.search(/\n\s*\d{1,2}\)\s+[A-Z]|\bBefore we leave\b|\bEND OF ROUND\b|\bTIE[\s-]?BREAKER\b/i);
+    if (stop >= 0) rest = rest.slice(0, stop);
+    let answer = squash(rest);
     if (!answer) return null;
 
     const fm = head.match(/^\s*([A-Za-z&,\s]*?)\s*[—–\-:]*\s*(Multiple[\s-]*Choice|Short[\s-]*Answer)\s*[:.\-—]?\s*/i);
     let catRaw = "", format = "sa";
     if (fm) { catRaw = fm[1]; format = /^m/i.test(fm[2]) ? "mc" : "sa"; head = head.slice(fm[0].length); }
     else {
+      const dm = head.match(/^\s*([A-Za-z& ]{3,40}?)\s*[\u2014\u2013\-:]\s+/);
       const cm = head.match(/^\s*([A-Z][A-Z &]+?)\s{1,}(?=[A-Z][a-z])/);
-      if (cm) { catRaw = cm[1]; head = head.slice(cm[0].length); }
+      if (dm && categoryKey(dm[1]) !== "other") { catRaw = dm[1]; head = head.slice(dm[0].length); }
+      else if (cm) { catRaw = cm[1]; head = head.slice(cm[0].length); }
     }
     const cat = categoryKey(catRaw);
 
     let stem = head, choices = null, letter = null;
-    if (format === "mc") {
+    const labeledMC = format === "mc";
+    if (labeledMC || /^\(?[WXYZ]\)/.test(answer)) {
       const pos = [];
       const re = /(^|[\s(])([WXYZ])\)\s+/g;
       let c;
@@ -112,9 +132,22 @@
         const p = pos.find((x) => x.L === L && (!seq.length || x.at > seq[seq.length - 1].at));
         if (p) seq.push(p);
       }
+      if (seq.length < 4) {
+        // choices printed out of order (e.g. W, Y, X, Z): accept when each letter appears exactly once
+        const tail = pos.slice(-4);
+        if (pos.length >= 4 && new Set(tail.map((p) => p.L)).size === 4) {
+          const texts = {};
+          tail.forEach((p, i) => (texts[p.L] = squash(head.slice(p.end, i < 3 ? tail[i + 1].at : head.length))));
+          stem = head.slice(0, tail[0].at);
+          choices = ["W", "X", "Y", "Z"].map((L) => texts[L]);
+          seq.length = 0;
+        }
+      }
       if (seq.length === 4) {
         stem = head.slice(0, seq[0].at);
         choices = seq.map((p, i) => squash(head.slice(p.end, i < 3 ? seq[i + 1].at : head.length)));
+      }
+      if (choices) {
         const lm = answer.match(/^\(?([WXYZ])\b/);
         letter = lm ? lm[1] : null;
         if (!letter) {
@@ -122,7 +155,10 @@
           if (hit >= 0) letter = "WXYZ"[hit];
         }
       }
-      if (!choices || !letter) format = "sa";
+      if (choices && choices.some((x) => !x || x.length > 300)) choices = null;   // garbled layout (e.g. stacked fractions)
+      if (choices && letter) format = "mc";
+      else if (/^\(?[WXYZ]\)/.test(answer)) return null;          // a choice question we can't show properly
+      else { choices = null; format = "sa"; }
     }
     stem = squash(stem);
     if (!stem) return null;

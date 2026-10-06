@@ -631,20 +631,27 @@ function loadPdfJs() {
   });
   return pdfjsReady;
 }
+const SUP = { 0: "⁰", 1: "¹", 2: "²", 3: "³", 4: "⁴", 5: "⁵", 6: "⁶", 7: "⁷", 8: "⁸", 9: "⁹", "+": "⁺", "-": "⁻", "−": "⁻", "–": "⁻", n: "ⁿ" };
 async function pdfText(buf) {
   const lib = await loadPdfJs();
   const pdf = await lib.getDocument({ data: new Uint8Array(buf) }).promise;
   let out = "";
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p), tc = await page.getTextContent();
-    let lastY = null, lastEnd = null;
+    let lastY = null, lastEnd = null, lineSize = null;
     for (const it of tc.items) {
-      if (!("str" in it)) continue;
-      const x = it.transform[4], y = it.transform[5];
-      if (lastY !== null && Math.abs(y - lastY) > 2) out += "\n";
+      if (!("str" in it) || !it.str) continue;
+      const x = it.transform[4], y = it.transform[5], size = Math.hypot(it.transform[2], it.transform[3]) || it.height || 10;
+      const raw = it.str.trim();
+      // exponents (11², 10⁶) are printed smaller and raised: keep them as superscripts
+      if (lastY !== null && lineSize && size < 0.8 * lineSize && y > lastY + 0.3 && y - lastY < lineSize && /^[0-9n+\-−–]{1,3}$/.test(raw)) {
+        out += [...raw].map((ch) => SUP[ch] || ch).join(""); lastEnd = x + (it.width || 0); continue;
+      }
+      if (lastY !== null && Math.abs(y - lastY) > 0.6 * Math.max(size, lineSize || size)) { out += "\n"; lastEnd = null; lineSize = null; }
       else if (lastEnd !== null && x - lastEnd > 1 && !/\s$/.test(out) && !/^\s/.test(it.str)) out += " ";
       out += it.str;
-      if (it.hasEOL) { out += "\n"; lastY = null; lastEnd = null; } else { lastY = y; lastEnd = x + (it.width || 0); }
+      if (it.hasEOL) { out += "\n"; lastY = null; lastEnd = null; lineSize = null; }
+      else { lastY = y; lastEnd = x + (it.width || 0); lineSize = Math.max(lineSize || 0, raw ? size : 0) || null; }
     }
     out += "\n";
   }
