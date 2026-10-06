@@ -35,6 +35,38 @@ async function loadAll() {
   const p = await idb.get("progress");
   if (p) prog = { ...prog, ...p, settings: { ...DEFAULT_SETTINGS, ...(p.settings || {}) } };
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+  await loadSharedBank();
+}
+/* Shared question bank: questions.json uploaded next to index.html gives every device the same rounds. */
+async function loadSharedBank() {
+  let bank;
+  try {
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 8000);
+    const res = await fetch("questions.json", { cache: "no-cache", signal: ctl.signal }); clearTimeout(t);
+    if (!res.ok) return;
+    bank = await res.json();
+  } catch (e) { return; }
+  if (!bank || bank.app !== "buzzer-lab" || !Array.isArray(bank.rounds)) return;
+  if (prog.bankStamp === bank.exportedAt) return;   // already loaded this version of the bank
+  for (const r of bank.rounds) {
+    if (!r || !r.source || !Array.isArray(r.questions) || !r.questions.length) continue;
+    await idb.set("round:" + r.source, r.questions);
+    [...Q.keys()].forEach((id) => { if (Q.get(id).source === r.source) Q.delete(id); });
+    r.questions.forEach((q) => Q.set(q.id, q));
+    rounds = rounds.filter((x) => x.source !== r.source);
+    rounds.push({ source: r.source, label: r.label, level: r.level, count: r.questions.length, problems: r.problems || 0, added: r.added || Date.now(), shared: true });
+  }
+  await idb.set("rounds", rounds);
+  prog.bankStamp = bank.exportedAt;
+  await idb.set("progress", prog);
+}
+function exportBank() {
+  const bank = { app: "buzzer-lab", v: 1, exportedAt: new Date().toISOString(),
+    rounds: rounds.map((r) => ({ ...r, shared: undefined, questions: [...Q.values()].filter((q) => q.source === r.source) })).filter((r) => r.questions.length) };
+  const blob = new Blob([JSON.stringify(bank)], { type: "application/json" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "questions.json";
+  document.body.appendChild(a); a.click(); a.remove();
+  return bank.rounds.length;
 }
 let saveT = null;
 function saveProgress() { clearTimeout(saveT); saveT = setTimeout(() => idb.set("progress", prog).catch(() => toast("Couldn't save progress on this device.")), 250); }
@@ -562,6 +594,9 @@ function roundsHTML() {
       <details><summary class="small">Paste the text of a round instead</summary>
         <div class="stack tight" style="margin-top:10px"><textarea id="pasteIn" rows="6" placeholder="Copy everything from a round PDF and paste it here"></textarea><div class="row"><button class="btn" id="pasteGo">Add pasted round</button></div></div></details>
     </div>
+    ${mine.length ? `<div class="panel stack"><div><h3>Share these rounds with every device</h3>
+      <p class="small muted maxw">Save all ${mine.length} round${mine.length === 1 ? "" : "s"} as one file named <b>questions.json</b>, then upload it to your GitHub repository next to index.html. Every phone, tablet, or computer that opens your link will then load them automatically. Export and upload again whenever you add rounds.</p></div>
+      <div><button class="btn primary" id="expBank">Export question bank</button></div></div>` : ""}
     ${mine.length ? `<div class="panel stack"><h3>Added (${mine.length} round${mine.length === 1 ? "" : "s"} · ${Q.size} questions)</h3><div class="list">${mine.map((r) => `<div class="item"><div class="body"><div class="q">${esc(r.label)}</div><div class="a">${r.count} questions${r.problems ? ` · ${r.problems} couldn't be read` : ""}</div></div><button class="btn ghost small" data-rm="${esc(r.source)}">Remove</button></div>`).join("")}</div></div>` : ""}
     <div class="panel stack"><h3>Middle school</h3>${setList("MS")}</div>
     <div class="panel stack"><h3>High school</h3>${setList("HS")}</div>
@@ -571,6 +606,7 @@ function bindRounds() {
   $$("details.set").forEach((d) => d.addEventListener("toggle", () => { if (d.open) openSet = d.dataset.set; }));
   $$("input[name=ilv]").forEach((i) => (i.onchange = () => (importLevel = i.value)));
   $("#pdfIn").onchange = async (e) => { const files = [...e.target.files]; e.target.value = ""; await importFiles(files); };
+  const eb = $("#expBank"); if (eb) eb.onclick = () => { const n = exportBank(); toast(`Saved questions.json with ${n} round${n === 1 ? "" : "s"}`); };
   $("#pasteGo").onclick = async () => {
     const txt = $("#pasteIn").value; if (!txt.trim()) return;
     const src = "paste-" + hash(txt.slice(0, 2000));
