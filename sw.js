@@ -1,5 +1,5 @@
 // Offline support: the app shell is cached on install; fonts and the PDF reader are cached the first time they load.
-const VERSION = "buzzerlab-v1";
+const VERSION = "buzzerlab-v2";
 const SHELL = ["./", "index.html", "manifest.webmanifest", "js/app.js", "js/parser.js", "js/catalog.js",
   "icons/icon-192.png", "icons/icon-512.png", "icons/apple-touch-icon.png"];
 const RUNTIME_HOSTS = ["fonts.googleapis.com", "fonts.gstatic.com", "cdnjs.cloudflare.com"];
