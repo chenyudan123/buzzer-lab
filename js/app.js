@@ -23,7 +23,9 @@ const idb = {
   del(k) { return new Promise((res, rej) => { const t = this.db.transaction("kv", "readwrite"); t.objectStore("kv").delete(k); t.oncomplete = () => res(); t.onerror = () => rej(t.error); }); },
 };
 const DEFAULT_SETTINGS = { mode: "mix", cats: null, level: "all", kind: "both", count: 20, focus: "all", round: "", gameFlow: true,
-  read: "voice", show: "text", rate: 1, voice: "", wordMs: 300 };
+  read: "voice", show: "text", rate: 1, voice: "", wordMs: 300, speed: "normal" };
+const SPEEDS = { relaxed: ["Relaxed", 0.95], normal: ["Normal", 1.1], quick: ["Quick", 1.25], fast: ["Fast", 1.4] };
+const speechRate = () => (SPEEDS[prog.settings.speed] || SPEEDS.normal)[1];
 let rounds = [];              // [{source,label,level,set,year,round,count,added}]
 let Q = new Map();            // id -> question
 let prog = { qstats: {}, attempts: [], sessions: [], settings: { ...DEFAULT_SETTINGS }, directBlocked: false };
@@ -152,6 +154,13 @@ function setupHTML() {
       <fieldset><legend><h3>Moderator</h3></legend><div class="chips">${chip("read", "voice", "Read aloud", st.read === "voice")}${chip("read", "text", "Text only", st.read === "text")}</div></fieldset>
       <fieldset id="showFs" ${st.read === "voice" ? "" : "hidden"}><legend><h3>While reading</h3></legend><div class="chips">${chip("show", "text", "Show the words", st.show === "text")}${chip("show", "listen", "Listen only", st.show === "listen")}</div></fieldset>
     </div>
+    <div id="voiceOpts" class="stack tight" ${st.read === "voice" && speech.ok ? "" : "hidden"}>
+      <div class="grid2">
+        <label class="field"><span>Voice</span><span class="row" style="flex-wrap:nowrap"><select id="voiceSel" style="flex:1">${voiceOptions()}</select><button type="button" class="btn small" id="testVoice">Test</button></span></label>
+        <fieldset><legend><h3>Reading speed</h3></legend><div class="chips">${Object.entries(SPEEDS).map(([k, [lbl]]) => chip("speed", k, lbl, (st.speed || "normal") === k)).join("")}</div></fieldset>
+      </div>
+      <p class="small muted" id="voiceTip">${voiceTip()}</p>
+    </div>
     <div class="row between">
       <span class="small muted" id="poolNote">${st.mode === "round" ? "" : `${n} matching question${n === 1 ? "" : "s"}`}</span>
       <button class="btn go" type="submit" id="startBtn" ${st.mode === "mix" && !n ? "disabled" : ""}>Start</button>
@@ -169,7 +178,8 @@ function readSetup() {
   st.mode = v("mode") || st.mode;
   const present = catsPresent(), cs = $$("input[name=cat]:checked", f).map((i) => i.value);
   st.cats = cs.length === present.length ? null : cs;
-  ["level", "kind", "focus", "read", "show"].forEach((k) => { const x = v(k); if (x) st[k] = x; });
+  ["level", "kind", "focus", "read", "show", "speed"].forEach((k) => { const x = v(k); if (x) st[k] = x; });
+  const vs = $("#voiceSel"); if (vs && vs.value) st.voice = vs.value;
   const c = v("count"); if (c) st.count = +c;
   const rs = $("#roundSel"); if (rs) st.round = rs.value;
   const gf = $("#gameFlow"); if (gf) st.gameFlow = gf.checked;
@@ -180,11 +190,13 @@ function bindSetup() {
   f.addEventListener("change", () => {
     readSetup(); const st = prog.settings;
     $("#mixOpts").hidden = st.mode !== "mix"; $("#roundOpts").hidden = st.mode !== "round"; $("#showFs").hidden = st.read !== "voice";
+    $("#voiceOpts").hidden = st.read !== "voice" || !speech.ok;
     const n = pool(st).length;
     $("#poolNote").textContent = st.mode === "round" ? "" : `${n} matching question${n === 1 ? "" : "s"}`;
     $("#startBtn").disabled = st.mode === "mix" && !n;
     saveProgress();
   });
+  const tv = $("#testVoice"); if (tv) tv.onclick = () => { readSetup(); saveProgress(); speech.sample(); };
   f.addEventListener("submit", (e) => {
     e.preventDefault(); readSetup(); saveProgress(); speech.unlock();
     const st = prog.settings;
@@ -196,21 +208,68 @@ function bindSetup() {
 }
 
 /* ================= SPEECH ================= */
+// Novelty and very old voices that ship on Apple devices: robotic, so never pick them by default.
+const BAD_VOICES = /^(Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Deranged|Fred|Good News|Hysterical|Jester|Junior|Kathy|Organ|Pipe Organ|Ralph|Superstar|Trinoids|Whisper|Wobble|Zarvox|Grandma|Grandpa|Eddy|Flo|Reed|Rocko|Sandy|Shelley|Princess|Bruce|Agnes|Vicki|Victoria)\b/i;
+const GOOD_VOICES = /\b(Ava|Samantha|Allison|Susan|Zoe|Evan|Nathan|Joelle|Noelle|Tom|Alex|Aaron|Nicky|Serena|Daniel|Karen|Moira|Tessa|Aria|Jenny|Guy|Michelle|Ana|Christopher|Eric|Emma|Brian|Andrew|Ryan|Sonia|Libby|Natasha|William)\b/i;
+function voiceScore(v) {
+  let s = 0;
+  if (BAD_VOICES.test(v.name)) s -= 100;
+  if (/premium|enhanced|natural|neural/i.test(v.name)) s += 60;      // downloaded high-quality or neural voices
+  else if (/online/i.test(v.name)) s += 45;                           // Microsoft Edge online voices
+  if (/^Google/i.test(v.name)) s += 35;
+  if (GOOD_VOICES.test(v.name)) s += 20;
+  if (/en[-_]US/i.test(v.lang)) s += 10; else if (/en[-_](GB|AU|CA|IE|NZ)/i.test(v.lang)) s += 6;
+  if (v.default) s += 3;
+  return s;
+}
 const speech = {
   ok: "speechSynthesis" in self,
   voices: [],
   unlock() { if (!this.ok) return; try { const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u); } catch (e) {} },
   loadVoices() {
     if (!this.ok) return;
-    const pick = () => { this.voices = speechSynthesis.getVoices().filter((v) => /^en/i.test(v.lang)); };
+    const pick = () => {
+      const seen = new Set();
+      this.voices = speechSynthesis.getVoices().filter((v) => /^en/i.test(v.lang) && !seen.has(v.voiceURI) && seen.add(v.voiceURI))
+        .sort((a, b) => voiceScore(b) - voiceScore(a) || a.name.localeCompare(b.name));
+      const sel = $("#voiceSel"); if (sel) { sel.innerHTML = voiceOptions(); const tip = $("#voiceTip"); if (tip) tip.innerHTML = voiceTip(); }
+    };
     pick(); speechSynthesis.onvoiceschanged = pick;
+    setTimeout(pick, 600); setTimeout(pick, 2000);   // some browsers fill the list late and never fire the event
   },
   voice() {
     const want = prog.settings.voice;
-    return this.voices.find((v) => v.voiceURI === want) || this.voices.find((v) => /en-US/i.test(v.lang) && v.localService) || this.voices.find((v) => /en-US/i.test(v.lang)) || this.voices[0] || null;
+    return this.voices.find((v) => v.voiceURI === want) || this.voices[0] || null;
+  },
+  sample() {
+    if (!this.ok) return; this.cancel();
+    const u = new SpeechSynthesisUtterance("Toss-up 1. Physics. Short answer. What is the SI unit of force? Remember, you have five seconds to buzz.");
+    const v = this.voice(); if (v) { u.voice = v; u.lang = v.lang; } u.rate = speechRate();
+    speechSynthesis.speak(u);
   },
   cancel() { if (this.ok) try { speechSynthesis.cancel(); } catch (e) {} },
 };
+function voiceLabel(v) {
+  const lang = /GB/i.test(v.lang) ? " · British" : /AU/i.test(v.lang) ? " · Australian" : /IE/i.test(v.lang) ? " · Irish" : /IN/i.test(v.lang) ? " · Indian" : /ZA/i.test(v.lang) ? " · S. African" : "";
+  return v.name.replace(/^Microsoft\s+/i, "").replace(/\s*-\s*English.*$/i, "") + lang;
+}
+function voiceOptions() {
+  const list = speech.voices.filter((v) => voiceScore(v) > -50);
+  if (!list.length) return `<option value="">Default voice</option>`;
+  const cur = speech.voice();
+  return list.slice(0, 40).map((v) => `<option value="${esc(v.voiceURI)}" ${cur && cur.voiceURI === v.voiceURI ? "selected" : ""}>${esc(voiceLabel(v))}</option>`).join("");
+}
+function voiceTip() {
+  const hasGreat = speech.voices.some((v) => /premium|enhanced|natural|neural|online/i.test(v.name));
+  if (hasGreat) return "Voices marked Premium, Enhanced, or Natural sound the most human.";
+  const ua = navigator.userAgent;
+  if (/iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && "ontouchend" in document))
+    return "For a much more natural voice, download one: <b>Settings → Accessibility → Spoken Content → Voices → English</b>, pick a voice such as Ava or Zoe, and choose the <b>Premium</b> or <b>Enhanced</b> version. Then fully close and reopen this app.";
+  if (/Android/.test(ua))
+    return "For a more natural voice: <b>Settings → Accessibility → Text-to-speech output</b>, choose <b>Speech Services by Google</b>, tap the gear, then <b>Install voice data → English (United States)</b> and pick a voice.";
+  if (/Edg\//.test(ua)) return "Voices whose names end in Online (Natural) sound the most human.";
+  return "Tip: the Microsoft Edge browser includes very natural voices, marked Online (Natural).";
+}
 
 /* ================= PLAY ================= */
 let G = null, timers = [];
@@ -248,17 +307,35 @@ function buildTokens(q) {
   // each token: {t: display text, s: spoken text, line: starts a choice line, head: format label}
   const toks = [];
   const head = `${q.kind === "B" ? "Bonus" : "Toss-up"}. ${CAT[q.cat] || q.catLabel}. ${q.format === "mc" ? "Multiple choice" : "Short answer"}.`;
-  toks.push({ t: q.format === "mc" ? "Multiple Choice" : "Short Answer", s: head, head: 1 });
-  const words = (s) => s.split(/\s+/).filter(Boolean).map((w) => ({ t: w, s: /^\[.*\]$|^\[|\]$/.test(w) ? "" : w }));
+  toks.push({ t: q.format === "mc" ? "Multiple Choice" : "Short Answer", s: head.replace(/^(Bonus|Toss-up)\./, `$1 ${q.num}.`), head: 1 });
+  const words = (s) => s.split(/\s+/).filter(Boolean).map((w) => ({ t: w, s: /^\[.*\]$|^\[|\]$/.test(w) ? "" : say(w) }));
   // keep bracketed pronunciations out of speech even when they span words
   let inBr = false;
-  words(q.q).forEach((w) => { if (w.t.startsWith("[")) inBr = true; toks.push({ t: w.t, s: inBr ? "" : w.t }); if (w.t.includes("]")) inBr = false; });
+  // inside a [pronunciation guide] say nothing, but keep punctuation that follows it ("[GAM-eets]?")
+  const brPunct = (t) => { const m = t.match(/\]([.,?!;:]+)$/); return m ? m[1] : ""; };
+  words(q.q).forEach((w) => { if (w.t.startsWith("[")) inBr = true; toks.push({ t: w.t, s: inBr ? brPunct(w.t) : say(w.t) }); if (w.t.includes("]")) inBr = false; });
   if (q.format === "mc") q.ch.forEach((c, ix) => {
     toks.push({ t: L[ix] + ")", s: L[ix] + ",", line: 1 });
     inBr = false;
-    words(c).forEach((w) => { if (w.t.startsWith("[")) inBr = true; toks.push({ t: w.t, s: inBr ? "" : w.t }); if (w.t.includes("]")) inBr = false; });
+    words(c).forEach((w) => { if (w.t.startsWith("[")) inBr = true; toks.push({ t: w.t, s: inBr ? brPunct(w.t) : say(w.t) }); if (w.t.includes("]")) inBr = false; });
+    // a short pause after each choice
+    for (let k = toks.length - 1; k >= 0 && !toks[k].line; k--) if (toks[k].s) { if (!/[.?!,;:]$/.test(toks[k].s)) toks[k].s += "."; break; }
   });
   return toks;
+}
+// how symbols should sound when read aloud
+const SUPN = { "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9", "⁻": "negative ", "ⁿ": "n", "⁺": "" };
+function say(w) {
+  return w
+    .replace(/([0-9A-Za-z)])²(?![⁰-⁹])/g, "$1 squared").replace(/([0-9A-Za-z)])³(?![⁰-⁹])/g, "$1 cubed")
+    .replace(/[⁻⁺]?[⁰¹²³⁴⁵⁶⁷⁸⁹ⁿ]+/g, (m) => {
+      const n = [...m].map((c) => SUPN[c] ?? c).join("");
+      const sfx = /n$/.test(n) ? "th" : /1[123]$/.test(n) ? "th" : /1$/.test(n) ? "st" : /2$/.test(n) ? "nd" : /3$/.test(n) ? "rd" : "th";
+      return " to the " + n + sfx + " power";
+    })
+    .replace(/√/g, "square root of ").replace(/π/g, "pi").replace(/×/g, " times ").replace(/÷/g, " divided by ")
+    .replace(/°/g, " degrees").replace(/≤/g, " less than or equal to ").replace(/≥/g, " greater than or equal to ")
+    .replace(/\s+/g, " ").trim();
 }
 function readByTimer() {
   const c = G.cur, ms = prog.settings.read === "voice" && !speech.ok ? 300 : prog.settings.wordMs || 300;
@@ -266,24 +343,29 @@ function readByTimer() {
 }
 function readAloud() {
   const c = G.cur;
-  // split into short utterances: header, each sentence of the stem, each choice
+  // Read the whole question as one continuous utterance so there are no gaps between pieces.
+  // Network voices (e.g. Chrome's "Google" voices) stop after ~15 seconds, so those get sentence-sized chunks.
+  const voice = speech.voice();
+  const chunky = voice && !voice.localService;
   const segs = []; let cur = null;
   c.toks.forEach((t, i) => {
-    if (!cur || t.head || t.line || (i > 0 && /[.?!]$/.test(c.toks[i - 1].t) && !c.toks[i - 1].line && !c.toks[i - 1].head && cur.text.length > 120)) { cur = { from: i, offs: [], text: "" }; segs.push(cur); }
-    if (t.head && i === 0) { cur.offs.push(0); cur.text = t.s + " "; cur = null; return; }
-    cur.offs.push(cur.text.length); cur.text += (t.s ? t.s + " " : "");
+    const prev = c.toks[i - 1];
+    const brk = chunky && cur && cur.text.length > 60 && (t.line && !prev.line ? true : prev && /[.?!]$/.test(prev.s || "") && !t.line && cur.text.length > 140);
+    if (!cur || brk) { cur = { from: i, offs: [], text: "" }; segs.push(cur); }
+    cur.offs.push(cur.text.length);
+    if (t.s && /^[.,?!;:]+$/.test(t.s)) cur.text = cur.text.replace(/\s+$/, "") + t.s + " ";
+    else cur.text += (t.s ? t.s + " " : "");
   });
   let boundaryWorks = false, started = false, finished = false;
-  const fallbackMs = 330 / (prog.settings.rate || 1);
+  const fallbackMs = 330 / speechRate();
   const reveal = (n) => { if (n > c.shown) { c.shown = Math.min(n, c.toks.length); paintText(); } };
   timers.push(setInterval(() => { if (started && !boundaryWorks && c.phase === "reading" && c.shown < c.toks.length - 1) reveal(c.shown + 1); }, fallbackMs));
   // if the voice never starts (no voices installed, muted engine), fall back to timed reveal
   timers.push(setTimeout(() => { if (!started && c === G.cur && c.phase === "reading") readByTimerFrom(); }, 4000));
-  const voice = speech.voice();
   segs.forEach((sg, k) => {
     const u = new SpeechSynthesisUtterance(sg.text);
     if (voice) u.voice = voice;
-    u.lang = voice ? voice.lang : "en-US"; u.rate = prog.settings.rate || 1;
+    u.lang = voice ? voice.lang : "en-US"; u.rate = speechRate();
     u.onstart = () => { started = true; reveal(sg.from + 1); };
     u.onboundary = (e) => {
       if (e.name && e.name !== "word") return;
